@@ -1,9 +1,8 @@
-// server.js
 import express from 'express';
 import cors from 'cors';
 import nodemailer from 'nodemailer';
 import { db, admin } from './firebaseAdmin.js';
-import fetch from 'node-fetch'; // ✅ required for self-ping
+import fetch from 'node-fetch'; // ✅ required for self-ping & push
 
 const app = express();
 app.use(cors());
@@ -62,6 +61,30 @@ function getDeliveryEmail(order) {
       '<p style="margin-top: 20px;">We appreciate your support! 🧁</p>' +
     '</div>'
   );
+}
+
+// 🔔 Send push notification via Expo
+async function sendPushNotification(expoPushToken, title, body, data = {}) {
+  try {
+    await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Accept-Encoding': 'gzip, deflate',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        to: expoPushToken,
+        sound: 'default',
+        title,
+        body,
+        data,
+      }),
+    });
+    console.log(`📲 Push notification sent to ${expoPushToken}`);
+  } catch (err) {
+    console.error('❌ Error sending push notification:', err.message);
+  }
 }
 
 // 🔥 Health check route
@@ -161,12 +184,61 @@ app.post('/verify-otp', async function(req, res) {
   }
 });
 
+/* ========== NEW ORDER NOTIFICATION LOGIC ========== */
+
+// Track last checked time
+let lastChecked = Date.now();
+
+async function checkForNewConfirmedOrders() {
+  try {
+    const snapshot = await db.collection('orders')
+      .where('timestamp', '>=', lastChecked)
+      .get();
+
+    const newOrders = [];
+    snapshot.forEach(docSnap => {
+      const order = docSnap.data();
+      if (order.orderStatus && order.orderStatus.toLowerCase() === 'confirmed') {
+        newOrders.push({ id: docSnap.id, ...order });
+      }
+    });
+
+    if (newOrders.length > 0) {
+      const tokenDocs = await db.collection('adminTokens').get();
+      const tokens = tokenDocs.docs
+        .map(d => d.data()?.expoPushToken)
+        .filter(Boolean);
+
+      for (const order of newOrders) {
+        const customer = order.address?.name || order.userEmail || 'Customer';
+        const amount = typeof order.total === 'number' ? order.total.toFixed(2) : '0.00';
+        await Promise.all(tokens.map(token =>
+          sendPushNotification(
+            token,
+            'New Order Confirmed 🧁',
+            `${customer} — ₹${amount}`,
+            { screen: 'OrdersScreen', orderId: order.id }
+          )
+        ));
+        console.log(`🔔 Notified admins about new order ${order.id}`);
+      }
+    }
+
+    lastChecked = Date.now();
+  } catch (err) {
+    console.error('Error checking for new orders:', err);
+  }
+}
+
+// Poll every 30 seconds
+setInterval(checkForNewConfirmedOrders, 30 * 1000);
+
 // ✅ Self-ping every 5 minutes
 const SELF_URL = "https://delivery-app-otp-verifier.onrender.com/"; // Replace with your actual Render app URL
 setInterval(() => {
   fetch(SELF_URL)
     .then(res => res.text())
-    .then(data => console.log("🔁 Self pinged server at /(root):", new Date().toLocaleTimeString()))
+    .then(() => console.log("🔁 Self pinged server at /(root):", new Date().toLocaleTimeString()))
     .catch(err => console.error("🛑 Failed to self-ping:", err.message));
 }, 5 * 60 * 1000); // every 5 minutes
 
